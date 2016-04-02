@@ -1,7 +1,9 @@
 enable_testing()
 
 find_package(Check)
-
+MESSAGE( STATUS "Check libraries path:         " ${CHECK_LIBRARIES} )
+MESSAGE( STATUS "Check include path:         " ${CHECK_INCLUDE_DIRS} )
+MESSAGE( STATUS "Check definition flags:         " ${CHECK_DEFINITIONS} )
 set(CHECK_FOUND 0)
 
 if (CHECK_FOUND)
