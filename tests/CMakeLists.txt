@@ -2,6 +2,8 @@ enable_testing()
 
 find_package(Check)
 
+set(CHECK_FOUND 0)
+
 if (CHECK_FOUND)
 
 include_directories(${CHECK_INCLUDE_DIRS})
