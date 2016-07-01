@@ -1,7 +1,6 @@
 find_package(PkgConfig)
 
 set(CHECK_FOUND 0)
-# pkg_search_module(CHECK check)
 
 if(NOT CHECK_FOUND)
 
