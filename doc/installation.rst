@@ -24,7 +24,7 @@ Requirements
  - (optional) libcheck (check_) to run the C tests.
  - (optional) python (python_) for the python bindings.
  - (optional) mako (mako_) for development or running the python bindings.
- - (optional) Cython >= 0.19 (cython_) for the python bindings.
+ - (optional) Cython >= 0.21 (cython_) for the python bindings.
  - (optional) nosetests (nosetests_) to run the python tests.
 
 .. note::
@@ -80,11 +80,13 @@ computer, you can install them in your home directory like this:
 ::
 
   cd <dir>
+  rm -rf build Build
   mkdir Build
   cd Build
   cmake .. -DCMAKE_INSTALL_PREFIX=~/.local -DCMAKE_BUILD_TYPE=Release
   make
   make install
+  make test
 
   cd ..
 
@@ -97,6 +99,8 @@ computer, you can install them in your home directory like this:
 
   python setup.py build
   python setup.py install --user
+  cd
+  python -c "import pygpu;pygpu.test()"
 
 
 Linux-specific instructions

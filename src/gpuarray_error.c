@@ -21,6 +21,8 @@ const char *gpuarray_error_str(int err) {
   case GA_UNALIGNED_ERROR:   return "Unaligned array";
   case GA_COPY_ERROR:        return "Copy is needed but disallowed by parameters";
   case GA_NODEV_ERROR:       return "No devices are available";
+  case GA_MISC_ERROR:        return "Undeterminate error";
+  case GA_COMM_ERROR:        return "Error in collectives call";
   default: return "Unknown GA error";
   }
 }

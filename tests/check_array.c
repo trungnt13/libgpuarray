@@ -1,73 +1,20 @@
-#include <check.h>
-#include <gpuarray/array.h>
-#include <gpuarray/error.h>
-#include <gpuarray/types.h>
-
 #include <limits.h>
 #include <stdlib.h>
 
-void *ctx;
-const gpuarray_buffer_ops *ops;
+#include <check.h>
+
+#include "gpuarray/array.h"
+#include "gpuarray/error.h"
+#include "gpuarray/types.h"
+
+extern void *ctx;
+
+void setup(void);
+void teardown(void);
 
 #define ga_assert_ok(e) ck_assert_int_eq(e, GA_NO_ERROR)
 
-int get_env_dev(const gpuarray_buffer_ops **o) {
-  char *dev;
-  char *end;
-  long no;
-  int d;
-  if ((dev = getenv("GPUARRAY_TEST_DEVICE")) == NULL) {
-    if ((dev = getenv("DEVICE")) == NULL) {
-      *o = gpuarray_get_ops("opencl");
-      return 0; /* opencl0:0 */
-    }
-  }
-  if (strncmp(dev, "cuda", 4) == 0) {
-    *o = gpuarray_get_ops("cuda");
-    no = strtol(dev + 4, &end, 10);
-    if (end == dev || *end != '\0')
-      return -1;
-    if (no < 0 || no > INT_MAX)
-      return -1; 
-    return (int)no;
-  }
-  if (strncmp(dev, "opencl", 6) == 0) {
-    *o = gpuarray_get_ops("opencl");
-    no = strtol(dev + 6, &end, 10);
-    if (end == dev || *end != ':')
-      return -1;
-    if (no < 0 || no > 32768)
-      return -1;
-    d = (int)no;
-    dev = end;
-    no = strtol(dev + 1, &end, 10);
-    if (end == dev || *end != '\0')
-      return -1;
-    if (no < 0 || no > 32768)
-      return -1;
-    d <<= 16;
-    d |= (int)no;
-    return d;
-  }
-  return -1;
-}
-
-void setup(void) {
-  int dev = get_env_dev(&ops);
-  if (dev == -1)
-    ck_abort_msg("Bad test device");
-  ctx = ops->buffer_init(dev, 0, NULL);
-  ck_assert_ptr_ne(ctx, NULL);
-}
-
-void teardown(void) {
-  ops->buffer_deinit(ctx);
-  ctx = NULL;
-  ops = NULL;
-}
-
-START_TEST(test_take1_ok)
-{
+START_TEST(test_take1_ok) {
   GpuArray base;
   GpuArray idx;
   GpuArray res;
@@ -78,18 +25,17 @@ START_TEST(test_take1_ok)
                                      6,  7,  8,  9, 10, 11,
                                     12, 13, 14, 15, 16, 17,
                                     18, 19, 20, 21, 22, 23};
-  uint32_t buf[12*24];
+  uint32_t buf[12 * 24];
   static const size_t data_dims[1] = {24};
   ssize_t indexes[12];
   size_t dims[3];
 
-  ga_assert_ok(GpuArray_empty(&base, ops, ctx, GA_UINT, 1, data_dims,
-                              GA_C_ORDER));
+  ga_assert_ok(GpuArray_empty(&base, ctx, GA_UINT, 1, data_dims, GA_C_ORDER));
   ga_assert_ok(GpuArray_write(&base, data, sizeof(data)));
   dims[0] = 12;
-  ga_assert_ok(GpuArray_empty(&idx, ops, ctx, GA_SSIZE, 1, dims, GA_C_ORDER));
+  ga_assert_ok(GpuArray_empty(&idx, ctx, GA_SSIZE, 1, dims, GA_C_ORDER));
   dims[1] = 6;
-  ga_assert_ok(GpuArray_empty(&res, ops, ctx, GA_UINT, 2, dims, GA_C_ORDER));
+  ga_assert_ok(GpuArray_empty(&res, ctx, GA_UINT, 2, dims, GA_C_ORDER));
 
   /* test v[[1, 0]] on 1d (4) */
   indexes[0] = 1;
@@ -195,23 +141,23 @@ START_TEST(test_take1_ok)
   dims[1] = 2;
   dims[2] = 3;
   ga_assert_ok(GpuArray_reshape_inplace(&vres, 3, dims, GA_C_ORDER));
-  
+
   ga_assert_ok(GpuArray_take1(&vres, &v, &vidx, 0));
   ga_assert_ok(GpuArray_read(buf, sizeof(uint32_t) * 72, &vres));
 
   /* 0 */
-  ck_assert(buf[ 0] == 18);
-  ck_assert(buf[ 1] == 19);
-  ck_assert(buf[ 2] == 20);
-  ck_assert(buf[ 3] == 21);
-  ck_assert(buf[ 4] == 22);
-  ck_assert(buf[ 5] == 23);
+  ck_assert(buf[0] == 18);
+  ck_assert(buf[1] == 19);
+  ck_assert(buf[2] == 20);
+  ck_assert(buf[3] == 21);
+  ck_assert(buf[4] == 22);
+  ck_assert(buf[5] == 23);
 
   /* 1 */
-  ck_assert(buf[ 6] == 18);
-  ck_assert(buf[ 7] == 19);
-  ck_assert(buf[ 8] == 20);
-  ck_assert(buf[ 9] == 21);
+  ck_assert(buf[6] == 18);
+  ck_assert(buf[7] == 19);
+  ck_assert(buf[8] == 20);
+  ck_assert(buf[9] == 21);
   ck_assert(buf[10] == 22);
   ck_assert(buf[11] == 23);
 
@@ -301,6 +247,7 @@ Suite *get_suite(void) {
   Suite *s = suite_create("array");
   TCase *tc = tcase_create("take1");
   tcase_add_checked_fixture(tc, setup, teardown);
+  tcase_set_timeout(tc, 8.0);
   tcase_add_test(tc, test_take1_ok);
   suite_add_tcase(s, tc);
   return s;
