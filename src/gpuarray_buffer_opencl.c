@@ -32,6 +32,47 @@ static gpudata *cl_alloc(gpucontext *c, size_t size, void *data, int flags,
                          int *ret);
 static void cl_release(gpudata *b);
 static void cl_free_ctx(cl_ctx *ctx);
+static gpukernel *cl_newkernel(gpucontext *ctx, unsigned int count,
+                               const char **strings, const size_t *lengths,
+                               const char *fname, unsigned int argcount,
+                               const int *types, int flags, int *ret,
+                               char **err_str);
+static const char CL_CONTEXT_PREAMBLE[] =
+"#define GA_WARP_SIZE %lu\n";  // to be filled by cl_make_ctx()
+
+static inline int cl_get_platform_count(unsigned int* platcount) {
+  cl_uint nump;
+  err = clGetPlatformIDs(0, NULL, &nump);
+  if (err != CL_SUCCESS)
+    return GA_IMPL_ERROR;
+  *platcount = (unsigned int)nump;
+  return GA_NO_ERROR;
+}
+
+static int cl_get_device_count(unsigned int platform, unsigned int* devcount) {
+  cl_platform_id *ps;
+  cl_platform_id p;
+  cl_uint numd;
+  unsigned int platcount;
+  GA_CHECK(cl_get_platform_count(&platcount));
+
+  ps = calloc(sizeof(*ps), platcount);
+  if (ps == NULL)
+    return GA_MEMORY_ERROR;
+  err = clGetPlatformIDs(platcount, ps, NULL);
+  if (err != CL_SUCCESS) {
+    free(ps);
+    return GA_IMPL_ERROR;
+  }
+  p = ps[platform];
+
+  err = clGetDeviceIDs(p, CL_DEVICE_TYPE_ALL, 0, NULL, &numd);
+  free(ps);
+  if (err != CL_SUCCESS)
+    return GA_IMPL_ERROR;
+  *devcount = (unsigned int)numd;
+  return GA_NO_ERROR;
+}
 
 static cl_device_id get_dev(cl_context ctx, int *ret) {
   size_t sz;
@@ -62,6 +103,12 @@ cl_ctx *cl_make_ctx(cl_context ctx, int flags) {
   size_t len;
   int64_t v = 0;
   int e = 0;
+  size_t warp_size;
+  int ret;
+  const char dummy_kern[] = "__kernel void kdummy() {}\n";
+  strb context_preamble = STRB_STATIC_INIT;
+  const char *rlk[1];
+  gpukernel *m;
 
   id = get_dev(ctx, NULL);
   if (id == NULL) return NULL;
@@ -90,6 +137,7 @@ cl_ctx *cl_make_ctx(cl_context ctx, int flags) {
   res->refcnt = 1;
   res->exts = NULL;
   res->blas_handle = NULL;
+  res->preamble = NULL;
   res->q = clCreateCommandQueue(
     ctx, id,
     ISSET(flags, GA_CTX_SINGLE_STREAM) ? 0 : qprop&CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
@@ -108,12 +156,35 @@ cl_ctx *cl_make_ctx(cl_context ctx, int flags) {
   TAG_CTX(res);
   res->errbuf = cl_alloc((gpucontext *)res, 8, &v, GA_BUFFER_INIT, &e);
   if (e != GA_NO_ERROR) {
-    err = res->err;
-    cl_free_ctx(res);
-    return NULL;
+    goto fail;
   }
   res->refcnt--; /* Prevent ref loop */
+
+  /* Create per-context OpenCL preamble */
+
+  // Create a dummy kernel and check GA_KERNEL_PROP_PREFLSIZE
+  rlk[0] = dummy_kern;
+  len = sizeof(dummy_kern);
+  // this dummy kernel does not require a CLUDA preamble
+  m = cl_newkernel((gpucontext *)res, 1, rlk, &len, "kdummy", 0, NULL, 0, &ret, NULL);
+  if (m == NULL)
+    goto fail;
+  ret = cl_property((gpucontext *)res, NULL, m, GA_KERNEL_PROP_PREFLSIZE, &warp_size);
+  if (ret != GA_NO_ERROR)
+    goto fail;
+
+  // Write the preferred workgroup multiple as GA_WARP_SIZE in preamble
+  strb_appendf(&context_preamble, CL_CONTEXT_PREAMBLE, (unsigned long)warp_size);
+  res->preamble = strb_cstr(&context_preamble);
+  if (res->preamble == NULL)
+    goto fail;
+
   return res;
+
+fail:
+  err = res->err;
+  cl_free_ctx(res);
+  return NULL;
 }
 
 cl_command_queue cl_get_stream(gpucontext *ctx) {
@@ -138,6 +209,8 @@ static void cl_free_ctx(cl_ctx *ctx) {
     }
     clReleaseCommandQueue(ctx->q);
     clReleaseContext(ctx->ctx);
+    if (ctx->preamble != NULL)
+      free(ctx->preamble);
     CLEAR(ctx);
     free(ctx);
   }
@@ -180,11 +253,6 @@ cl_mem cl_get_buf(gpudata *g) { ASSERT_BUF(g); return g->buf; }
 #define CL_DOUBLE "cl_khr_fp64"
 #define CL_HALF "cl_khr_fp16"
 
-static gpukernel *cl_newkernel(gpucontext *ctx, unsigned int count,
-                               const char **strings, const size_t *lengths,
-                               const char *fname, unsigned int argcount,
-                               const int *types, int flags, int *ret,
-                               char **err_str);
 static void cl_releasekernel(gpukernel *k);
 static int cl_callkernel(gpukernel *k, unsigned int n,
                          const size_t *bs, const size_t *gs,
@@ -408,11 +476,13 @@ static gpudata *cl_alloc(gpucontext *c, size_t size, void *data, int flags,
 
   if (flags & GA_BUFFER_READ_ONLY) {
     if (flags & GA_BUFFER_WRITE_ONLY) FAIL(NULL, GA_VALUE_ERROR);
+    clflags &= ~CL_MEM_READ_WRITE;
     clflags |= CL_MEM_READ_ONLY;
   }
 
   if (flags & GA_BUFFER_WRITE_ONLY) {
     if (flags & GA_BUFFER_READ_ONLY) FAIL(NULL, GA_VALUE_ERROR);
+    clflags &= ~CL_MEM_READ_WRITE;
     clflags |= CL_MEM_WRITE_ONLY;
   }
 
@@ -672,7 +742,11 @@ static int cl_memset(gpudata *dst, size_t offset, int data) {
 static int cl_check_extensions(const char **preamble, unsigned int *count,
                                int flags, cl_ctx *ctx) {
   if (flags & GA_USE_CLUDA) {
+    // add the common preamble
     preamble[*count] = CL_PREAMBLE;
+    (*count)++;
+    // add the per-context preamble
+    preamble[*count] = ctx->preamble;
     (*count)++;
   }
   if (flags & GA_USE_SMALL) {
@@ -713,11 +787,13 @@ static gpukernel *cl_newkernel(gpucontext *c, unsigned int count,
   cl_program p;
   // Sync this table size with the number of flags that can add stuff
   // at the beginning
-  const char *preamble[4];
+  const char *preamble[5];
   size_t *newl = NULL;
   const char **news = NULL;
   unsigned int n = 0;
   int error;
+  strb debug_msg = STRB_STATIC_INIT;
+  size_t log_size;
 
   ASSERT_CTX(ctx);
 
@@ -780,12 +856,10 @@ static gpukernel *cl_newkernel(gpucontext *c, unsigned int count,
     if (ctx->err == CL_BUILD_PROGRAM_FAILURE && err_str!=NULL) {
       *err_str = NULL;  // Fallback, in case there's an error
 
-      strb debug_msg = STRB_STATIC_INIT;
       // We're substituting debug_msg for a string with this first line:
       strb_appends(&debug_msg, "Program build failure ::\n");
 
       // Determine the size of the log
-      size_t log_size;
       clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
 
       if(strb_ensure(&debug_msg, log_size)!=-1 && log_size>=1) { // Checks strb has enough space
@@ -1041,6 +1115,10 @@ static int cl_transfer(gpudata *dst, size_t dstoff,
 
 #ifdef WITH_OPENCL_CLBLAS
 extern gpuarray_blas_ops clblas_ops;
+#else
+#ifdef WITH_OPENCL_CLBLAST
+extern gpuarray_blas_ops clblast_ops;
+#endif
 #endif
 
 static int cl_property(gpucontext *c, gpudata *buf, gpukernel *k, int prop_id,
@@ -1167,8 +1245,13 @@ static int cl_property(gpucontext *c, gpudata *buf, gpukernel *k, int prop_id,
     *((gpuarray_blas_ops **)res) = &clblas_ops;
     return GA_NO_ERROR;
 #else
+#ifdef WITH_OPENCL_CLBLAST
+    *((gpuarray_blas_ops **)res) = &clblast_ops;
+    return GA_NO_ERROR;
+#else
     *((void **)res) = NULL;
     return GA_DEVSUP_ERROR;
+#endif
 #endif
 
   case GA_CTX_PROP_COMM_OPS:
@@ -1370,31 +1453,34 @@ static int cl_property(gpucontext *c, gpudata *buf, gpukernel *k, int prop_id,
 
 static const char *cl_error(gpucontext *c) {
   cl_ctx *ctx = (cl_ctx *)c;
-  if (ctx == NULL)
+  if (ctx == NULL){
     return get_error_string(err);
-  else
+  }else{
     ASSERT_CTX(ctx);
     return get_error_string(ctx->err);
+  }
 }
 
 GPUARRAY_LOCAL
-const gpuarray_buffer_ops opencl_ops = {cl_init,
-                                       cl_deinit,
-                                       cl_alloc,
-                                       cl_retain,
-                                       cl_release,
-                                       cl_share,
-                                       cl_move,
-                                       cl_read,
-                                       cl_write,
-                                       cl_memset,
-                                       cl_newkernel,
-                                       cl_retainkernel,
-                                       cl_releasekernel,
-                                       cl_setkernelarg,
-                                       cl_callkernel,
-                                       cl_kernelbin,
-                                       cl_sync,
-                                       cl_transfer,
-                                       cl_property,
-                                       cl_error};
+const gpuarray_buffer_ops opencl_ops = {cl_get_platform_count,
+                                        cl_get_device_count,
+                                        cl_init,
+                                        cl_deinit,
+                                        cl_alloc,
+                                        cl_retain,
+                                        cl_release,
+                                        cl_share,
+                                        cl_move,
+                                        cl_read,
+                                        cl_write,
+                                        cl_memset,
+                                        cl_newkernel,
+                                        cl_retainkernel,
+                                        cl_releasekernel,
+                                        cl_setkernelarg,
+                                        cl_callkernel,
+                                        cl_kernelbin,
+                                        cl_sync,
+                                        cl_transfer,
+                                        cl_property,
+                                        cl_error};

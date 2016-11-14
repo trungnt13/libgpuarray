@@ -4,6 +4,7 @@ from cpython.mem cimport PyMem_Malloc, PyMem_Free
 from libc.string cimport strncmp
 
 cimport numpy as np
+import numpy as np
 
 from cpython cimport Py_INCREF, PyNumber_Index
 from cpython.object cimport Py_EQ, Py_NE
@@ -487,6 +488,26 @@ cdef GpuContext ensure_context(GpuContext c):
 cdef bint pygpu_GpuArray_Check(object o):
     return isinstance(o, GpuArray)
 
+def count_platforms(kind):
+    """Return number of host's platforms compatible with `kind`.
+    """
+    cdef unsigned int platcount
+    cdef int err
+    err = gpu_get_platform_count(_s(kind), &platcount)
+    if err != GA_NO_ERROR:
+        raise get_exc(err), gpucontext_error(NULL, err)
+    return platcount
+
+def count_devices(kind, unsigned int platform):
+    """Returns number of devices in host's `platform` compatible with `kind`.
+    """
+    cdef unsigned int devcount
+    cdef int err
+    err = gpu_get_device_count(_s(kind), platform, &devcount)
+    if err != GA_NO_ERROR:
+        raise get_exc(err), gpucontext_error(NULL, err)
+    return devcount
+
 cdef GpuContext pygpu_init(dev, int flags):
     if dev.startswith('cuda'):
         kind = b"cuda"
@@ -768,7 +789,7 @@ def from_gpudata(size_t data, offset, dtype, shape, GpuContext context=None,
     :type shape: iterable of ints
     :param context: context of the gpudata
     :type context: GpuContext
-    :param strides: strides for the results
+    :param strides: strides for the results (C contiguous if not specified)
     :type strides: iterable of ints
     :param writable: is the data writable?
     :type writeable: bool
@@ -818,7 +839,7 @@ def from_gpudata(size_t data, offset, dtype, shape, GpuContext context=None,
         else:
             size = gpuarray_get_elsize(typecode)
             for i in range(nd-1, -1, -1):
-                strides[i] = size
+                cstrides[i] = size
                 size *= cdims[i]
 
         return pygpu_fromgpudata(<gpudata *>data, offset, typecode, nd, cdims,
@@ -1403,6 +1424,33 @@ def _concatenate(list al, unsigned int axis, int restype, object cls,
     finally:
         PyMem_Free(als)
 
+cdef int (*cuda_get_ipc_handle)(gpudata *, GpuArrayIpcMemHandle *)
+cdef gpudata *(*cuda_open_ipc_handle)(gpucontext *, GpuArrayIpcMemHandle *, size_t)
+
+cuda_get_ipc_handle = <int (*)(gpudata *, GpuArrayIpcMemHandle *)>gpuarray_get_extension("cuda_get_ipc_handle")
+cuda_open_ipc_handle = <gpudata *(*)(gpucontext *, GpuArrayIpcMemHandle *, size_t)>gpuarray_get_extension("cuda_open_ipc_handle")
+
+def open_ipc_handle(GpuContext c, bytes hpy, size_t l):
+    """
+    Open an IPC handle to get a new GpuArray from it.
+
+    :param c: context
+    :param hpy: binary handle data received
+    :param l: size of the referred memory block
+
+    """
+    cdef char *b
+    cdef GpuArrayIpcMemHandle h
+    cdef gpudata *d
+
+    b = hpy
+    memcpy(&h, b, sizeof(h))
+
+    d = cuda_open_ipc_handle(c.ctx, &h, l)
+    if d is NULL:
+        raise GpuArrayException, "could not open handle"
+    return <size_t>d
+
 cdef class GpuArray:
     """
     Device array
@@ -1413,7 +1461,7 @@ cdef class GpuArray:
     directly.
 
     You can also subclass this class and make the module create your
-    instances by passing the `cls` agument to any method that return a
+    instances by passing the `cls` argument to any method that return a
     new GpuArray.  This way of creating the class will NOT call your
     :meth:`__init__` method.
 
@@ -1464,6 +1512,94 @@ cdef class GpuArray:
             step[0] = 1
         else:
             raise IndexError, "cannot index with: %s" % (key,)
+
+    def write(self, np.ndarray src not None):
+        """Writes host's Numpy array to device's GpuArray.
+
+        This method is as fast as or even faster than :ref:asarray, because it
+        skips possible allocation of a buffer in device's memory. It uses this
+        already allocated GpuArray buffer to contain `src` array from host's
+        memory. It is required though that the GpuArray and the Numpy array are
+        compatible in byte size and data type. It is also needed for the
+        GpuArray to be well behaved and contiguous. If `src` is not aligned or
+        compatible in contiguity it will be copied to a new Numpy array in order
+        to be. It is allowed for this GpuArray and `src` to have different
+        shapes.
+
+        :param src: source array in host
+        :type src: np.ndarray
+
+        :raises ValueError: If this GpuArray is not compatible with `src` or
+            if it is not well behaved or contiguous.
+
+        """
+        if not self.flags.behaved:
+            raise ValueError, "Destination GpuArray is not well behaved: aligned and writeable"
+        if self.flags.c_contiguous:
+            src = np.asarray(src, order='C')
+        elif self.flags.f_contiguous:
+            src = np.asarray(src, order='F')
+        else:
+            raise ValueError, "Destination GpuArray is not contiguous"
+        if self.dtype != src.dtype:
+            raise ValueError, "GpuArray and Numpy array do not have matching data types"
+        cdef size_t npsz = np.PyArray_NBYTES(src)
+        cdef size_t sz = gpuarray_get_elsize(self.ga.typecode)
+        cdef unsigned i
+        for i in range(self.ga.nd):
+            sz *= self.ga.dimensions[i]
+        if sz != npsz:
+            raise ValueError, "GpuArray and Numpy array do not have the same size in bytes"
+        array_write(self, np.PyArray_DATA(src), sz)
+
+    def read(self, np.ndarray dst not None):
+        """Reads from this GpuArray into host's Numpy array.
+
+        This method is as fast as or even faster than :ref:__array__ method and
+        thus :ref:numpy.asarray. This is because it skips allocation of a new
+        buffer in host's memory to contain device's GpuArray. It uses an
+        existing Numpy ndarray as a buffer to get the GpuArray. It is required
+        though that the GpuArray and the Numpy array to be compatible in byte
+        size, contiguity and data type. It is also needed for `dst` to be
+        writeable and properly aligned in host's memory and for `self` to be
+        contiguous. It is allowed for this GpuArray and `dst` to have different
+        shapes.
+
+        :param dst: destination array in host
+        :type dst: np.ndarray
+
+        :raises ValueError: If this GpuArray is not compatible with `src` or
+            if `dst` is not well behaved.
+
+        """
+        if not np.PyArray_ISBEHAVED(dst):
+            raise ValueError, "Destination Numpy array is not well behaved: aligned and writeable"
+        if not ((self.flags.c_contiguous and self.flags.aligned and dst.flags['C_CONTIGUOUS']) or \
+                (self.flags.f_contiguous and self.flags.aligned and dst.flags['F_CONTIGUOUS'])):
+            raise ValueError, "GpuArray and Numpy array do not match in contiguity or GpuArray is not aligned"
+        if self.dtype != dst.dtype:
+            raise ValueError, "GpuArray and Numpy array do not have matching data types"
+        cdef size_t npsz = np.PyArray_NBYTES(dst)
+        cdef size_t sz = gpuarray_get_elsize(self.ga.typecode)
+        cdef unsigned i
+        for i in range(self.ga.nd):
+            sz *= self.ga.dimensions[i]
+        if sz != npsz:
+            raise ValueError, "GpuArray and Numpy array do not have the same size in bytes"
+        array_read(np.PyArray_DATA(dst), sz, self)
+
+    def get_ipc_handle(self):
+        cdef GpuArrayIpcMemHandle h
+        cdef int err
+        if cuda_get_ipc_handle is NULL:
+            raise SystemError, "Could not get necessary extension"
+        if self.context.kind != b'cuda':
+            raise ValueError, "Only works for cuda contexts"
+        err = cuda_get_ipc_handle(self.ga.data, &h)
+        if err != GA_NO_ERROR:
+            raise get_exc(err), GpuArray_error(&self.ga, err)
+        res = <bytes>(<char *>&h)[:sizeof(h)]
+        return res
 
     def __array__(self):
         """
@@ -1842,7 +1978,10 @@ cdef class GpuArray:
         return str(numpy.asarray(self))
 
     def __repr__(self):
-        return 'gpuarray.' + repr(numpy.asarray(self))
+        try:
+            return 'gpuarray.' + repr(numpy.asarray(self))
+        except Exception:
+            return 'gpuarray.array(<content not available>)'
 
 
 

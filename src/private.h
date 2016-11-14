@@ -74,6 +74,8 @@ typedef struct _partial_gpucomm {
 } partial_gpucomm;
 
 struct _gpuarray_buffer_ops {
+  int (*get_platform_count)(unsigned int* platcount);
+  int (*get_device_count)(unsigned int platform, unsigned int* devcount);
   gpucontext *(*buffer_init)(int dev, int flags, int *ret);
   void (*buffer_deinit)(gpucontext *ctx);
   gpudata *(*buffer_alloc)(gpucontext *ctx, size_t sz, void *data, int flags,
@@ -273,15 +275,6 @@ GPUARRAY_LOCAL void gpukernel_source_with_line_numbers(unsigned int count,
     int err = (cmd);        \
     if (err != GA_NO_ERROR) \
       return err;           \
-  } while (0)
-
-#define GA_EXIT_ON_ERROR(ctx, cmd) \
-  do {                             \
-    int err = (cmd);               \
-    if (err != GA_NO_ERROR) {      \
-      cuda_exit((ctx));            \
-      return err;                  \
-    }                              \
   } while (0)
 
 #ifdef __cplusplus

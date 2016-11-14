@@ -66,8 +66,10 @@ static int ga_extcopy(GpuArray *dst, const GpuArray *src) {
     if (k == NULL)
       return GA_MISC_ERROR;
     aa = memdup(&a, sizeof(a));
-    if (aa == NULL)
+    if (aa == NULL) {
+      GpuElemwise_free(k);
       return GA_MEMORY_ERROR;
+    }
     if (ctx->extcopy_cache == NULL)
       ctx->extcopy_cache = cache_twoq(4, 8, 8, 2, extcopy_eq, extcopy_hash,
                                       extcopy_free,
@@ -278,7 +280,7 @@ int GpuArray_index_inplace(GpuArray *a, const ssize_t *starts,
       return GA_VALUE_ERROR;
     }
     if (steps[i] == 0 &&
-	(starts[i] == -1 || starts[i] >= a->dimensions[i])) {
+	(starts[i] == -1 || (size_t)starts[i] >= a->dimensions[i])) {
       free(newdims);
       free(newstrs);
       return GA_VALUE_ERROR;
@@ -368,8 +370,9 @@ static int gen_take1_kernel(GpuKernel *k, gpucontext *ctx, char **err_str,
     atypes[apos++] = GA_SSIZE;
     atypes[apos++] = GA_SIZE;
   }
-  strb_appends(&sb, " GLOBAL_MEM const ga_ssize *ind, ga_size n0, ga_size n1,"
-               " GLOBAL_MEM int* err) {\n");
+  strb_appendf(&sb, " GLOBAL_MEM const %s *ind, ga_size n0, ga_size n1,"
+               " GLOBAL_MEM int* err) {\n",
+               gpuarray_get_type(ind->typecode)->cluda_name);
   atypes[apos++] = GA_BUFFER;
   atypes[apos++] = GA_SIZE;
   atypes[apos++] = GA_SIZE;
@@ -496,8 +499,11 @@ int GpuArray_take1(GpuArray *a, const GpuArray *v, const GpuArray *i,
     pl = ls[0];
     ls[0] = ls[1];
     ls[1] = pl;
+    gs[0] = 1;
+  } else {
+    gs[0] = gs[1];
+    gs[1] = 1;
   }
-  gs[0] = 1;
 
   argp = 0;
   GpuKernel_setarg(&k, argp++, a->data);
@@ -579,7 +585,8 @@ int GpuArray_setarray(GpuArray *a, const GpuArray *v) {
   tv.dimensions = a->dimensions;
   tv.strides = strs;
   /* This could be optiomized by setting the right flags */
-  tv.flags &= ~(GA_C_CONTIGUOUS|GA_F_CONTIGUOUS);
+  if (tv.nd != 0)
+    tv.flags &= ~(GA_C_CONTIGUOUS|GA_F_CONTIGUOUS);
   err = ga_extcopy(a, &tv);
   free(strs);
   return err;
@@ -659,10 +666,10 @@ int GpuArray_reshape_inplace(GpuArray *a, unsigned int nd,
 
     for (ok = oi; ok < oj - 1; ok++) {
       if (ord == GA_F_ORDER) {
-        if (a->strides[ok+1] != a->dimensions[ok]*a->strides[ok])
+        if (a->strides[ok+1] != (ssize_t)a->dimensions[ok]*a->strides[ok])
           goto need_copy;
       } else {
-        if (a->strides[ok] != a->dimensions[ok+1]*a->strides[ok+1])
+        if (a->strides[ok] != (ssize_t)a->dimensions[ok+1]*a->strides[ok+1])
           goto need_copy;
       }
     }
@@ -1040,7 +1047,7 @@ void GpuArray_fprintf(FILE *fd, const GpuArray *a) {
   unsigned int i;
   int comma = 0;
 
-  fprintf(fd, "GpuNdArray <%p, data: %p (%p)> nd=%d\n",
+  fprintf(fd, "GpuArray <%p, data: %p (%p)> nd=%d\n",
           a, a->data, *((void **)a->data), a->nd);
   fprintf(fd, "\tdims: %p, str: %p\n", a->dimensions, a->strides);
   fprintf(fd, "\tITEMSIZE: %zd\n", GpuArray_ITEMSIZE(a));
@@ -1061,7 +1068,11 @@ void GpuArray_fprintf(FILE *fd, const GpuArray *a) {
     comma = 1;                                \
   }
   PRINTFLAG(GA_C_CONTIGUOUS);
+  if (!GpuArray_is_c_contiguous(a) && ISSET(a->flags, GA_C_CONTIGUOUS))
+    fputc('!', fd);
   PRINTFLAG(GA_F_CONTIGUOUS);
+  if (!GpuArray_is_f_contiguous(a) && ISSET(a->flags, GA_F_CONTIGUOUS))
+    fputc('!', fd);
   PRINTFLAG(GA_ALIGNED);
   PRINTFLAG(GA_WRITEABLE);
 #undef PRINTFLAG
@@ -1117,8 +1128,7 @@ int GpuArray_is_c_contiguous(const GpuArray *a) {
   int i;
 
   for (i = a->nd - 1; i >= 0; i--) {
-    if (a->dimensions[i] != 1 && a->strides[i] != size)
-      return 0;
+    if (a->strides[i] != (ssize_t)size) return 0;
     // We suppose that overflow will not happen since data has to fit in memory
     size *= a->dimensions[i];
   }
@@ -1130,7 +1140,7 @@ int GpuArray_is_f_contiguous(const GpuArray *a) {
   unsigned int i;
 
   for (i = 0; i < a->nd; i++) {
-    if (a->dimensions[i] != 1 && a->strides[i] != size) return 0;
+    if (a->strides[i] != (ssize_t)size) return 0;
     // We suppose that overflow will not happen since data has to fit in memory
     size *= a->dimensions[i];
   }

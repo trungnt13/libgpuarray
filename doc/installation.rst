@@ -19,6 +19,7 @@ Requirements
  - cmake >= 3.0 (cmake_).
  - a c99-compliant compiler (or MSVC if on windows).
  - (optional) CUDA >= 6.5 (cuda_).
+ - (optional) NVIDIA NCCL (nccl_).
  - (optional) OpenCL runtime.
  - (optional) clBLAS (clblas_).
  - (optional) libcheck (check_) to run the C tests.
@@ -34,6 +35,11 @@ Requirements
 .. note::
    We support CUDA GPUs with `compute capability 2.0 (Fermi)
    <https://developer.nvidia.com/cuda-gpus>`_ and up.
+
+.. note::
+  In the case you want to build with collective operation support for CUDA,
+  you will need CUDA GPUs with `compute capability 3.0 (Kepler)
+  <https://developer.nvidia.com/cuda-gpus>`_ and up plus CUDA >= 7.
 
 Download
 --------
@@ -191,13 +197,10 @@ directory and run this command:
 
 ::
 
-  python -c "import pygpu;pygpu.test()"
+  DEVICE="<test device>" python -c "import pygpu;pygpu.test()"
 
-By default it will attempt to run the test on 'opencl0:0'.  To use a
-different device set the environment variable DEVICE or
-GPUARRAY_DEVICE to the desired device name.  See the documentation for
-:py:meth:`pygpu.gpuarray.init` for more details on the syntax of the
-device name.
+See the documentation for :py:meth:`pygpu.gpuarray.init` for more
+details on the syntax of the device name.
 
 The test script prints the device name of the chosen device so that
 you can confirm which device it is running on.
@@ -213,6 +216,8 @@ you can confirm which device it is running on.
 .. _clblas: https://github.com/clMathLibraries/clBLAS
 
 .. _cuda: https://developer.nvidia.com/category/zone/cuda-zone
+
+.. _nccl: https://github.com/NVIDIA/nccl
 
 .. _check: http://check.sourceforge.net/
 

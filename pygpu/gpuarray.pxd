@@ -70,6 +70,8 @@ cdef extern from "gpuarray/buffer.h":
     ctypedef struct gpukernel:
         pass
 
+    int gpu_get_platform_count(const char* name, unsigned int* platcount)
+    int gpu_get_device_count(const char* name, unsigned int platform, unsigned int* devcount)
     gpucontext *gpucontext_init(const char *name, int devno, int flags, int *ret)
     void gpucontext_deref(gpucontext *ctx)
     char *gpucontext_error(gpucontext *ctx, int err)
@@ -194,6 +196,9 @@ cdef extern from "gpuarray/array.h":
 
 cdef extern from "gpuarray/extension.h":
     void *gpuarray_get_extension(const char *)
+    ctypedef struct GpuArrayIpcMemHandle:
+        pass
+
     cdef int GPUARRAY_CUDA_CTX_NOFREE
 
 cdef type get_exc(int errcode)

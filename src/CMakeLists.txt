@@ -1,11 +1,17 @@
 include(CheckFunctionExists)
 
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DDEBUG")
+if(CMAKE_COMPILER_IS_GNUCC)
+  add_definitions(-Wdeclaration-after-statement)
+endif()
 
 find_package(CUDA)
 find_package(OpenCL)
-if(OPENCL_FOUND)
+if(OpenCL_FOUND)
 find_package(clBLAS)
+if(NOT CLBLAS_FOUND)
+find_package(CLBlast)
+endif()
 endif()
 if(CUDA_FOUND)
 find_package(NCCL)
@@ -53,6 +59,7 @@ gpuarray_array_collectives.c
 gpuarray_kernel.c
 gpuarray_extension.c
 gpuarray_elemwise.c
+gpuarray_reduction.c
 )
 
 check_function_exists(strlcat HAVE_STRL)
@@ -130,16 +137,21 @@ if (CUDA_FOUND)
   endif()
 endif()
 
-if(OPENCL_FOUND)
+if(OpenCL_FOUND)
   list(APPEND _GPUARRAY_SRC gpuarray_buffer_opencl.c)
   add_definitions(-DWITH_OPENCL)
-  include_directories(${OPENCL_INCLUDE_DIRS})
+  include_directories(${OpenCL_INCLUDE_DIRS})
 
   if(CLBLAS_FOUND)
     message(STATUS "Building with CLBLAS")
     list(APPEND _GPUARRAY_SRC gpuarray_blas_opencl_clblas.c)
     add_definitions(-DWITH_OPENCL_CLBLAS)
     include_directories(${CLBLAS_INCLUDE_DIRS})
+  elseif(CLBLAS_FOUND)
+    message(STATUS "Building with CLBLAST")
+    list(APPEND _GPUARRAY_SRC gpuarray_blas_opencl_clblast.c)
+    add_definitions(-DWITH_OPENCL_CLBLAST)
+    include_directories(${CLBLAST_INCLUDE_DIRS})
   endif()
 endif()
 
@@ -171,9 +183,9 @@ if(CUDA_FOUND)
   endif()
 endif()
 
-if(OPENCL_FOUND)
-  target_link_libraries(gpuarray ${OPENCL_LIBRARIES})
-  target_link_libraries(gpuarray-static ${OPENCL_LIBRARIES})
+if(OpenCL_FOUND)
+  target_link_libraries(gpuarray ${OpenCL_LIBRARIES})
+  target_link_libraries(gpuarray-static ${OpenCL_LIBRARIES})
   if (CLBLAS_FOUND)
     target_link_libraries(gpuarray ${CLBLAS_LIBRARIES})
     target_link_libraries(gpuarray-static ${CLBLAS_LIBRARIES})

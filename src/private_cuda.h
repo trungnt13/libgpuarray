@@ -46,6 +46,24 @@
 /* Keep in sync with the copy in gpuarray/extension.h */
 #define DONTFREE 0x10000000
 
+#define GA_CUDA_EXIT_ON_ERROR(ctx, cmd) \
+  do {                                  \
+    int err = (cmd);                    \
+    if (err != GA_NO_ERROR) {           \
+      cuda_exit((ctx));                 \
+      return err;                       \
+    }                                   \
+  } while (0)
+
+#define CUDA_EXIT_ON_ERROR(ctx, cmd)  \
+  do {                                \
+    (ctx)->err = (cmd);               \
+    if ((ctx)->err != CUDA_SUCCESS) { \
+      cuda_exit((ctx));               \
+      return GA_IMPL_ERROR;           \
+    }                                 \
+  } while (0)
+
 typedef struct _cuda_context {
   GPUCONTEXT_HEAD;
   CUcontext ctx;
@@ -57,8 +75,8 @@ typedef struct _cuda_context {
   unsigned int enter;
 } cuda_context;
 
-STATIC_ASSERT(sizeof(cuda_context) <= sizeof(gpucontext), sizeof_struct_gpucontext_cuda);
-
+STATIC_ASSERT(sizeof(cuda_context) <= sizeof(gpucontext),
+              sizeof_struct_gpucontext_cuda);
 
 /*
  * About freeblocks.
@@ -103,8 +121,8 @@ struct _gpudata {
 #endif
 };
 
-GPUARRAY_LOCAL gpudata *cuda_make_buf(cuda_context *c, CUdeviceptr p, size_t sz);
-GPUARRAY_LOCAL CUdeviceptr cuda_get_ptr(gpudata *g);
+GPUARRAY_LOCAL gpudata *cuda_make_buf(cuda_context *c, CUdeviceptr p,
+                                      size_t sz);
 GPUARRAY_LOCAL size_t cuda_get_sz(gpudata *g);
 GPUARRAY_LOCAL int cuda_wait(gpudata *, int);
 GPUARRAY_LOCAL int cuda_record(gpudata *, int);
@@ -116,8 +134,9 @@ GPUARRAY_LOCAL int cuda_record(gpudata *, int);
 
 #define CUDA_WAIT_ALL   (CUDA_WAIT_READ|CUDA_WAIT_WRITE)
 
-#define CUDA_HEAD_ALLOC 0x40000
-#define CUDA_MAPPED_PTR 0x80000
+#define CUDA_IPC_MEMORY 0x100000
+#define CUDA_HEAD_ALLOC 0x200000
+#define CUDA_MAPPED_PTR 0x400000
 
 struct _gpukernel {
   cuda_context *ctx; /* Keep the context first */

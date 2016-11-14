@@ -16,8 +16,14 @@
 #include "gpuarray/buffer.h"
 #include "gpuarray/util.h"
 #include "gpuarray/error.h"
-#include "gpuarray/extension.h"
 #include "gpuarray/buffer_blas.h"
+
+#include "gpuarray/extension.h"
+
+STATIC_ASSERT(DONTFREE == GPUARRAY_CUDA_CTX_NOFREE, cuda_nofree_eq);
+STATIC_ASSERT(CUDA_WAIT_READ == GPUARRAY_CUDA_WAIT_READ, cuda_wait_read_eq);
+STATIC_ASSERT(CUDA_WAIT_WRITE == GPUARRAY_CUDA_WAIT_WRITE, cuda_wait_write_eq);
+STATIC_ASSERT(sizeof(GpuArrayIpcMemHandle) == sizeof(CUipcMemHandle), cuda_ipcmem_eq);
 
 /* Allocations will be made in blocks of at least this size */
 #define BLOCK_SIZE (4 * 1024 * 1024)
@@ -27,6 +33,7 @@
 #define FRAG_SIZE (64)
 
 static CUresult err;
+static int init_done = 0;
 
 GPUARRAY_LOCAL const gpuarray_buffer_ops cuda_ops;
 
@@ -48,6 +55,28 @@ static int strb_eq(void *_k1, void *_k2) {
 static uint32_t strb_hash(void *_k) {
   strb *k = (strb *)_k;
   return XXH32(k->s, k->l, 42);
+}
+
+static int cuda_get_platform_count(unsigned int* platcount) {
+  *platcount = 1;  // CUDA works on NVIDIA's GPUs
+  return GA_NO_ERROR;
+}
+
+static int cuda_get_device_count(unsigned int platform,
+                                 unsigned int* devcount) {
+  int dv;
+  // platform number gets ignored in CUDA implementation
+  if (!init_done) {
+    err = cuInit(0);
+    if (err != CUDA_SUCCESS)
+      return GA_IMPL_ERROR;
+    init_done = 1;
+  }
+  err = cuDeviceGetCount(&dv);
+  if (err != CUDA_SUCCESS)
+    return GA_IMPL_ERROR;
+  *devcount = (unsigned int)dv;
+  return GA_NO_ERROR;
 }
 
 cuda_context *cuda_make_ctx(CUcontext ctx, int flags) {
@@ -284,7 +313,9 @@ static const char CUDA_PREAMBLE[] =
     "#define load_half(p) __half2float(*(p))\n"
     "#define store_half(p, v) (*(p) = __float2half_rn(v))\n"
     "#define GA_DECL_SHARED_PARAM(type, name)\n"
-    "#define GA_DECL_SHARED_BODY(type, name) extern __shared__ type name[];\n";
+    "#define GA_DECL_SHARED_BODY(type, name) extern __shared__ type name[];\n"
+    "#define GA_WARP_SIZE warpSize\n"
+    "#line 1\n";
 
 /* XXX: add complex, quads, longlong */
 /* XXX: add vector types */
@@ -343,7 +374,6 @@ static cuda_context *do_init(CUdevice dev, int flags, int *ret) {
 static gpucontext *cuda_init(int ord, int flags, int *ret) {
     CUdevice dev;
     cuda_context *res;
-    static int init_done = 0;
 
     if (!init_done) {
       err = cuInit(0);
@@ -531,6 +561,32 @@ static gpudata *cuda_alloc(gpucontext *c, size_t size, void *data, int flags,
   return res;
 }
 
+int cuda_get_ipc_handle(gpudata *d, GpuArrayIpcMemHandle *h) {
+  ASSERT_BUF(d);
+  cuda_enter(d->ctx);
+  CUDA_EXIT_ON_ERROR(d->ctx,
+                     cuIpcGetMemHandle((CUipcMemHandle *)h, d->ptr));
+  cuda_exit(d->ctx);
+  return GA_NO_ERROR;
+}
+
+gpudata *cuda_open_ipc_handle(gpucontext *c, GpuArrayIpcMemHandle *h, size_t sz) {
+  CUdeviceptr p;
+  cuda_context *ctx = (cuda_context *)c;
+  gpudata *d = NULL;
+
+  cuda_enter(ctx);
+  ctx->err = cuIpcOpenMemHandle(&p, *((CUipcMemHandle *)h),
+                                CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS);
+  if (ctx->err == CUDA_SUCCESS) {
+    d = cuda_make_buf(ctx, p, sz);
+    if (d != NULL)
+      d->flags |= CUDA_IPC_MEMORY;
+  }
+  cuda_exit(ctx);
+  return d;
+}
+
 static void cuda_retain(gpudata *d) {
   ASSERT_BUF(d);
   d->refcnt++;
@@ -555,6 +611,9 @@ static void cuda_free(gpudata *d) {
     cuda_context *ctx = d->ctx;
     if (d->flags & DONTFREE) {
       /* This is the path for "external" buffers */
+      deallocate(d);
+    } else if (d->flags & CUDA_IPC_MEMORY) {
+      cuIpcCloseMemHandle(d->ptr);
       deallocate(d);
     } else if (ctx->flags & GA_CTX_DISABLE_ALLOCATION_CACHE) {
       /* Just free the pointer */
@@ -626,23 +685,13 @@ static int cuda_waits(gpudata *a, int flags, CUstream s) {
   }
 
   cuda_enter(a->ctx);
-  if (flags & CUDA_WAIT_READ) {
-    /* We wait for writes that happened before since multiple reads at
-     * the same time are fine */
-    a->ctx->err = cuStreamWaitEvent(s, a->wev, 0);
-    if (a->ctx->err != CUDA_SUCCESS) {
-      cuda_exit(a->ctx);
-      return GA_IMPL_ERROR;
-    }
-  }
-  if (flags & CUDA_WAIT_WRITE) {
-    /* Make sure to not disturb previous reads */
-    a->ctx->err = cuStreamWaitEvent(s, a->rev, 0);
-    if (a->ctx->err != CUDA_SUCCESS) {
-      cuda_exit(a->ctx);
-      return GA_IMPL_ERROR;
-    }
-  }
+  /* We wait for writes that happened before since multiple reads at
+   * the same time are fine */
+  if (ISSET(flags, CUDA_WAIT_READ) || ISSET(flags, CUDA_WAIT_WRITE))
+    CUDA_EXIT_ON_ERROR(a->ctx, cuStreamWaitEvent(s, a->wev, 0));
+  /* Make sure to not disturb previous reads */
+  if (ISSET(flags, CUDA_WAIT_WRITE))
+    CUDA_EXIT_ON_ERROR(a->ctx, cuStreamWaitEvent(s, a->rev, 0));
   cuda_exit(a->ctx);
   return GA_NO_ERROR;
 }
@@ -657,10 +706,10 @@ static int cuda_records(gpudata *a, int flags, CUstream s) {
       ISSET(a->ctx->flags, GA_CTX_SINGLE_STREAM))
     return GA_NO_ERROR;
   cuda_enter(a->ctx);
-  if (flags & CUDA_WAIT_READ)
-    a->ctx->err = cuEventRecord(a->rev, s);
-  if (flags & CUDA_WAIT_WRITE)
-    a->ctx->err = cuEventRecord(a->wev, s);
+  if (ISSET(flags, CUDA_WAIT_READ))
+    CUDA_EXIT_ON_ERROR(a->ctx, cuEventRecord(a->rev, s));
+  if (ISSET(flags, CUDA_WAIT_WRITE))
+    CUDA_EXIT_ON_ERROR(a->ctx, cuEventRecord(a->wev, s));
   cuda_exit(a->ctx);
   a->ls = s;
   return GA_NO_ERROR;
@@ -685,18 +734,19 @@ static int cuda_move(gpudata *dst, size_t dstoff, gpudata *src,
 
     cuda_enter(ctx);
 
-    cuda_wait(src, CUDA_WAIT_READ);
-    cuda_wait(dst, CUDA_WAIT_WRITE);
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_wait(src, CUDA_WAIT_READ));
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_wait(dst, CUDA_WAIT_WRITE));
 
-    ctx->err = cuMemcpyDtoDAsync(dst->ptr + dstoff, src->ptr + srcoff, sz,
-                                 ctx->s);
-    if (ctx->err != CUDA_SUCCESS) {
-      cuda_exit(ctx);
-      return GA_IMPL_ERROR;
-    }
+    CUDA_EXIT_ON_ERROR(ctx,
+        cuMemcpyDtoDAsync(dst->ptr + dstoff, src->ptr + srcoff, sz, ctx->s));
 
-    cuda_record(src, CUDA_WAIT_READ);
-    cuda_record(dst, CUDA_WAIT_WRITE);
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_record(src, CUDA_WAIT_READ));
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_record(dst, CUDA_WAIT_WRITE));
+
     cuda_exit(ctx);
     return res;
 }
@@ -724,14 +774,14 @@ static int cuda_read(void *dst, gpudata *src, size_t srcoff, size_t sz) {
       }
       memcpy(dst, (void *)(src->ptr + srcoff), sz);
     } else {
-      cuda_waits(src, CUDA_WAIT_READ, ctx->mem_s);
+      GA_CUDA_EXIT_ON_ERROR(ctx,
+          cuda_waits(src, CUDA_WAIT_READ, ctx->mem_s));
 
-      ctx->err = cuMemcpyDtoHAsync(dst, src->ptr + srcoff, sz, ctx->mem_s);
-      if (ctx->err != CUDA_SUCCESS) {
-        cuda_exit(ctx);
-        return GA_IMPL_ERROR;
-      }
-      cuda_records(src, CUDA_WAIT_READ, ctx->mem_s);
+      CUDA_EXIT_ON_ERROR(ctx,
+          cuMemcpyDtoHAsync(dst, src->ptr + srcoff, sz, ctx->mem_s));
+
+      GA_CUDA_EXIT_ON_ERROR(ctx,
+          cuda_records(src, CUDA_WAIT_READ, ctx->mem_s));
     }
     cuda_exit(ctx);
     return GA_NO_ERROR;
@@ -761,15 +811,14 @@ static int cuda_write(gpudata *dst, size_t dstoff, const void *src,
       }
       memcpy((void *)(dst->ptr + dstoff), src, sz);
     } else {
-      cuda_waits(dst, CUDA_WAIT_WRITE, ctx->mem_s);
+      GA_CUDA_EXIT_ON_ERROR(ctx,
+          cuda_waits(dst, CUDA_WAIT_WRITE, ctx->mem_s));
 
-      ctx->err = cuMemcpyHtoDAsync(dst->ptr + dstoff, src, sz, ctx->mem_s);
-      if (ctx->err != CUDA_SUCCESS) {
-        cuda_exit(ctx);
-        return GA_IMPL_ERROR;
-      }
+      CUDA_EXIT_ON_ERROR(ctx,
+          cuMemcpyHtoDAsync(dst->ptr + dstoff, src, sz, ctx->mem_s));
 
-      cuda_records(dst, CUDA_WAIT_WRITE, ctx->mem_s);
+      GA_CUDA_EXIT_ON_ERROR(ctx,
+          cuda_records(dst, CUDA_WAIT_WRITE, ctx->mem_s));
     }
     cuda_exit(ctx);
     return GA_NO_ERROR;
@@ -784,16 +833,14 @@ static int cuda_memset(gpudata *dst, size_t dstoff, int data) {
 
     cuda_enter(ctx);
 
-    cuda_wait(dst, CUDA_WAIT_WRITE);
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_wait(dst, CUDA_WAIT_WRITE));
 
-    ctx->err = cuMemsetD8Async(dst->ptr + dstoff, data, dst->sz - dstoff,
-                               ctx->s);
-    if (ctx->err != CUDA_SUCCESS) {
-      cuda_exit(ctx);
-      return GA_IMPL_ERROR;
-    }
+    CUDA_EXIT_ON_ERROR(ctx,
+        cuMemsetD8Async(dst->ptr + dstoff, data, dst->sz - dstoff, ctx->s));
 
-    cuda_record(dst, CUDA_WAIT_WRITE);
+    GA_CUDA_EXIT_ON_ERROR(ctx,
+        cuda_record(dst, CUDA_WAIT_WRITE));
     cuda_exit(ctx);
     return GA_NO_ERROR;
 }
@@ -824,7 +871,7 @@ static int detect_arch(const char *prefix, char *ret, CUresult *err) {
   *err = get_cc(dev, &major, &minor);
   if (*err != CUDA_SUCCESS) return GA_IMPL_ERROR;
   res = snprintf(ret, sz, "%s%d%d", prefix, major, minor);
-  if (res == -1 || res > sz) return GA_UNSUPPORTED_ERROR;
+  if (res == -1 || res > (ssize_t)sz) return GA_UNSUPPORTED_ERROR;
   return GA_NO_ERROR;
 }
 
@@ -1161,6 +1208,7 @@ static gpukernel *cuda_newkernel(gpucontext *c, unsigned int count,
       res = (gpukernel *)cache_get(ctx->kernel_cache, &sb);
       if (res != NULL) {
         res->refcnt++;
+        strb_clear(&sb);
         return res;
       }
       bin = call_compiler(sb.s, sb.l, ctx->bin_id, &bin_len,
@@ -1247,11 +1295,10 @@ static gpukernel *cuda_newkernel(gpucontext *c, unsigned int count,
       strb_clear(&sb);
       FAIL(NULL, GA_MEMORY_ERROR);
     }
-    if (cache_add(ctx->kernel_cache, psb, res) != 0) {
-      FAIL(NULL, GA_MEMORY_ERROR);
-    }
     /* One of the refs is for the cache */
     res->refcnt++;
+    /* If this fails, it will free the key and remove a ref from the kernel. */
+    cache_add(ctx->kernel_cache, psb, res);
     return res;
 }
 
@@ -1286,8 +1333,9 @@ static int cuda_callkernel(gpukernel *k, unsigned int n,
 
     for (i = 0; i < k->argcount; i++) {
       if (k->types[i] == GA_BUFFER) {
-	/* We don't have any better info for now */
-	cuda_wait((gpudata *)args[i], CUDA_WAIT_READ|CUDA_WAIT_WRITE);
+        /* We don't have any better info for now */
+        GA_CUDA_EXIT_ON_ERROR(ctx,
+            cuda_wait((gpudata *)args[i], CUDA_WAIT_ALL));
       }
     }
 
@@ -1315,8 +1363,9 @@ static int cuda_callkernel(gpukernel *k, unsigned int n,
 
     for (i = 0; i < k->argcount; i++) {
       if (k->types[i] == GA_BUFFER) {
-	/* We don't have any better info for now */
-	cuda_record((gpudata *)args[i], CUDA_WAIT_READ|CUDA_WAIT_WRITE);
+        /* We don't have any better info for now */
+        GA_CUDA_EXIT_ON_ERROR(ctx,
+            cuda_record((gpudata *)args[i], CUDA_WAIT_ALL));
       }
     }
 
@@ -1340,12 +1389,16 @@ static int cuda_sync(gpudata *b) {
 
   ASSERT_BUF(b);
   cuda_enter(ctx);
-  ctx->err = cuEventSynchronize(b->wev);
-  if (ctx->err != CUDA_SUCCESS)
-    err = GA_IMPL_ERROR;
-  ctx->err = cuEventSynchronize(b->rev);
-  if (ctx->err != CUDA_SUCCESS)
-    err = GA_IMPL_ERROR;
+  if (ctx->flags & GA_CTX_SINGLE_STREAM) {
+    cuStreamSynchronize(ctx->s);
+  } else {
+    ctx->err = cuEventSynchronize(b->wev);
+    if (ctx->err != CUDA_SUCCESS)
+      err = GA_IMPL_ERROR;
+    ctx->err = cuEventSynchronize(b->rev);
+    if (ctx->err != CUDA_SUCCESS)
+      err = GA_IMPL_ERROR;
+  }
   cuda_exit(ctx);
   return err;
 }
@@ -1360,28 +1413,31 @@ static int cuda_transfer(gpudata *dst, size_t dstoff,
 
   cuda_enter(dst->ctx);
   /* Make sure we have a rev for the source */
-  cuda_records(src, CUDA_WAIT_READ|CUDA_WAIT_FORCE, src->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_records(src, CUDA_WAIT_READ|CUDA_WAIT_FORCE, src->ctx->mem_s));
   /* Make the destination stream wait for it */
-  cuda_waits(src, CUDA_WAIT_READ|CUDA_WAIT_FORCE, dst->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_waits(src, CUDA_WAIT_READ|CUDA_WAIT_FORCE, dst->ctx->mem_s));
 
   /* Also wait on the destination buffer */
-  cuda_waits(dst, CUDA_WAIT_WRITE, dst->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_waits(dst, CUDA_WAIT_WRITE, dst->ctx->mem_s));
 
-  dst->ctx->err = cuMemcpyPeerAsync(dst->ptr+dstoff, dst->ctx->ctx,
-                                    src->ptr+srcoff, src->ctx->ctx,
-                                    sz, dst->ctx->mem_s);
-  if (dst->ctx->err != CUDA_SUCCESS) {
-    cuda_exit(dst->ctx);
-    return GA_IMPL_ERROR;
-  }
+  CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuMemcpyPeerAsync(dst->ptr+dstoff, dst->ctx->ctx,
+                        src->ptr+srcoff, src->ctx->ctx,
+                        sz, dst->ctx->mem_s));
 
   /* This records the event in dst->wev */
-  cuda_records(dst, CUDA_WAIT_WRITE|CUDA_WAIT_FORCE, dst->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_records(dst, CUDA_WAIT_WRITE|CUDA_WAIT_FORCE, dst->ctx->mem_s));
   /* This makes the source stream wait on the wev of dst */
-  cuda_waits(dst, CUDA_WAIT_WRITE|CUDA_WAIT_FORCE, src->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_waits(dst, CUDA_WAIT_WRITE|CUDA_WAIT_FORCE, src->ctx->mem_s));
 
   /* This records the event on src->rev */
-  cuda_records(src, CUDA_WAIT_READ, src->ctx->mem_s);
+  GA_CUDA_EXIT_ON_ERROR(dst->ctx,
+      cuda_records(src, CUDA_WAIT_READ, src->ctx->mem_s));
 
   cuda_exit(dst->ctx);
   return GA_NO_ERROR;
@@ -1719,7 +1775,9 @@ static const char *cuda_error(gpucontext *c) {
 }
 
 GPUARRAY_LOCAL
-const gpuarray_buffer_ops cuda_ops = {cuda_init,
+const gpuarray_buffer_ops cuda_ops = {cuda_get_platform_count,
+                                      cuda_get_device_count,
+                                      cuda_init,
                                       cuda_deinit,
                                       cuda_alloc,
                                       cuda_retain,
